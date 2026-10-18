@@ -1,0 +1,382 @@
+#####################################################################
+#     PRINT START
+#####################################################################
+
+[gcode_macro PRINT_START]
+gcode:
+    # This part fetches data from your slicer. Such as bed, extruder, and chamber temps
+    {% set BED_TEMP = params.BED_TEMP|default(60)|float %}
+    {% set EXTRUDER_TEMP = params.EXTRUDER_TEMP|default(190)|float %}
+    {% set CHAMBER_TEMP = params.CHAMBER_TEMP|default("40")|int %}
+    
+    #turn on case light
+    CASELIGHT_ON
+    # Clear bed mesh
+    BED_MESH_CLEAR
+    # Reset Z-offset
+    SET_GCODE_OFFSET Z=0
+    # Start bed heating (but don't wait for it)
+    M140 S{BED_TEMP}
+    # Use absolute coordinates
+    G90
+    # Home the printer
+    G28
+    # Move nozzle up a little
+    G1 Z10 F3000
+    #Switch caselight to show preheat
+    CASELIGHT_HEATING
+    # Check if the bed temp is higher than 90c - if so then trigger a heatsoak.
+  {% if params.BED_TEMP|int > 90 %}
+    SET_FAN_SPEED FAN=Nevermore SPEED=1               # Turn on the nevermore
+    M140 S{BED_TEMP}                                  # Set the target temp for the bed
+    G1 Z20                                            # Move bed down
+    #SET_HEATER_TEMPERATURE HEATER=heater_chamber TARGET={CHAMBER_TEMP|default(0)}
+    TEMPERATURE_WAIT SENSOR="heater_generic heater_chamber" MINIMUM={CHAMBER_TEMP} # waits on chamber temp
+    HEAT_SOAK_IF_NEEDED
+
+  # If the bed temp is not over 90c, then skip the heatsoak and just heat up to set temp with a 1 min soak
+  {% else %}
+    M190 S{BED_TEMP}                                  # Set the target temp for the bed
+    G4 P60000                                           # Wait 1 min for the bedtemp to stabilize
+  {% endif %}
+
+    # Park to right of nozzle brush and wait for extruder temp
+    G1 X35 Y-25 Z24
+    # Preheat to nozzle to probing temp
+    M109 S175
+    # Clean nozzle before beacon contact
+    CLEAN_NOZZLE
+    # Move to Beacon auto calibrate position
+    G1 X108.5 Y100.5 Z5
+    # Auto-calibrate beacon offset
+    BEACON_AUTO_CALIBRATE
+    # adaptive bed mesh
+    ADAPTIVE_BED_MESH
+    # Apply initial z-offset
+    SET_GCODE_OFFSET Z=0.07
+    # Move nozzle for second nozzle clean
+    G1 X35 Y-25 Z24
+    # Set and wait for nozzle to reach temperature
+    M109 S{EXTRUDER_TEMP}
+    # Clean nozzle before print start
+    CLEAN_NOZZLE
+    # Turn caselight back onto regular mode
+    CASELIGHT_ON
+    # KAMP adaptive purge
+    LINE_PURGE
+
+    
+    
+#####################################################################
+#     PRINT END
+#####################################################################
+
+[gcode_macro PRINT_END]
+#   Use PRINT_END for the slicer ending script
+gcode:
+    #   Get Boundaries
+    {% set max_x = printer.configfile.config["stepper_x"]["position_max"]|float %}
+    {% set max_y = printer.configfile.config["stepper_y"]["position_max"]|float %}
+    {% set max_z = printer.configfile.config["stepper_z"]["position_max"]|float %}
+    
+    #   Check end position to determine safe directions to move
+    {% if printer.toolhead.position.x < (max_x - 15) %}
+        {% set x_safe = 10.0 %}
+    {% else %}
+        {% set x_safe = -10.0 %}
+    {% endif %}
+
+    {% if printer.toolhead.position.y < (max_y - 15) %}
+        {% set y_safe = 10.0 %}
+    {% else %}
+        {% set y_safe = -10.0 %}
+    {% endif %}
+
+    {% if printer.toolhead.position.z < (max_z - 2) %}
+        {% set z_safe = 50.0 %}
+    {% else %}
+        {% set z_safe = max_z - printer.toolhead.position.z %}
+    {% endif %}
+    
+    #  Commence PRINT_END
+    # wait for buffer to clear
+    M400 
+    # Turn off Chamber heater
+    SET_HEATER_TEMPERATURE HEATER=heater_chamber TARGET=0
+    # Switch caselight to finished mode
+    CASELIGHT_FINISHED
+    # zero the extruder
+    G92 E0
+    # relative positioning
+    G91
+    # retract
+    G1 E-5 F300 
+    # move nozzle up
+    G0 Z{z_safe} + Z10 F3600 
+    # move nozzle to safe X and Y
+    G0 X{x_safe} Y{y_safe} F20000
+    # turn off hotend
+    M104 S0
+    # turn off bed
+    M140 S0
+    # turn off fan
+    M106 S0
+    # absolute positioning
+    G90
+    # park nozzle at rear
+    G0 X{max_x / 2} Y{max_y - 5} F3600 
+    # Turn off motors
+    M84 
+    # Keep Nevermore on for longer 
+    UPDATE_DELAYED_GCODE ID=filter_off DURATION=180  
+    
+#####################################################################
+#     CHANGE FILAMENT
+#####################################################################
+
+[gcode_macro LOAD_FILAMENT]
+variable_load_distance:  75
+variable_purge_distance:  15
+gcode:
+    {% set speed = params.SPEED|default(300) %}
+    {% set max_velocity = printer.configfile.settings['extruder'].max_extrude_only_velocity  * 60 %}
+    SAVE_GCODE_STATE NAME=load_state
+    G91
+    G92 E0
+    G1 E{load_distance} F{max_velocity} # fast-load
+    G1 E{purge_distance} F{speed} # purge
+    RESTORE_GCODE_STATE NAME=load_state
+
+[gcode_macro UNLOAD_FILAMENT]
+variable_unload_distance:  75
+variable_purge_distance:  5
+gcode:
+    {% set speed = params.SPEED|default(300) %}
+    {% set max_velocity = printer.configfile.settings['extruder'].max_extrude_only_velocity  * 60 %}
+    SAVE_GCODE_STATE NAME=unload_state
+    G91
+    G92 E0
+    G1 E{purge_distance} F{speed} # purge
+    G1 E-{unload_distance} F{max_velocity} # fast-unload
+    RESTORE_GCODE_STATE NAME=unload_state
+
+#####################################################################
+#     NOZZLE BRUSH
+#####################################################################
+
+[gcode_macro PARK_BRUSH]
+gcode:
+    SET_SERVO SERVO=nozzle_brush ANGLE=90
+    G4 P1000
+    #SET_SERVO SERVO=nozzle_brush WIDTH=0
+
+[gcode_macro RAISE_BRUSH]
+gcode:
+    SET_SERVO SERVO=nozzle_brush ANGLE=0
+    G4 P2000
+    #SET_SERVO SERVO=nozzle_brush WIDTH=0
+
+
+######################################################################
+#  LINE_PURGE  –  Adaptive, always ≥6 mm clear of objects
+######################################################################
+[gcode_macro LINE_PURGE]
+description: Adaptive purge line that stays outside object bounding boxes
+
+variable_adaptive_enable: True
+variable_z_height: 0.3
+variable_purge_amount: 20
+variable_line_length: 15
+variable_flow_rate: 10
+variable_x_default: 3
+variable_y_default: 3
+variable_min_clearance: 6
+variable_x_margin: 3
+variable_y_margin: 3
+variable_bed_max_x: 220
+variable_bed_max_y: 220
+
+gcode:
+  {% set adaptive = adaptive_enable %}
+  {% set z_h = z_height %}
+  {% set purge_mm = purge_amount %}
+  {% set line_len = line_length %}
+  {% set flow = flow_rate %}
+  {% set xmin_margin = x_margin %}
+  {% set ymin_margin = y_margin %}
+  {% set clear = min_clearance %}
+  {% set bed_x = bed_max_x %}
+  {% set bed_y = bed_max_y %}
+
+  {% set nozzle_dia = printer.configfile.settings.extruder.nozzle_diameter | float %}
+  {% set cross_section = nozzle_dia * z_h %}
+  {% set purge_move_speed = (cross_section * flow * 60) | float %}
+  {% set travel_speed = (printer.toolhead.max_velocity | default(150) * 60) | float %}
+
+  {% set x_origin = x_default %}
+  {% set y_purge  = y_default %}
+  {% set purge_dir = "X+" %}
+
+  {% if adaptive and printer.exclude_object.objects is defined and printer.exclude_object.objects %}
+    {% set ns = namespace(all_points=[]) %}
+    {% for obj in printer.exclude_object.objects %}
+      {% set ns.all_points = ns.all_points + (obj.polygon | default([])) %}
+    {% endfor %}
+
+    {% if ns.all_points %}
+      {% set xs = ns.all_points | map(attribute=0) | list %}
+      {% set ys = ns.all_points | map(attribute=1) | list %}
+
+      {% set obj_xmin = xs | min %}
+      {% set obj_xmax = xs | max %}
+      {% set obj_ymin = ys | min %}
+      {% set obj_ymax = ys | max %}
+
+      {% set cand1_x = [obj_xmin, xmin_margin] | max %}
+      {% set cand1_y = obj_ymin - clear %}
+      {% set cand1_ok = cand1_y >= ymin_margin %}
+
+      {% set cand2_x = [obj_xmin + 5, xmin_margin] | max %}
+      {% set cand2_y = obj_ymin - clear %}
+      {% set cand2_ok = cand2_y >= ymin_margin %}
+
+      {% set cand3_x = obj_xmin - clear %}
+      {% set cand3_y = [obj_ymin, ymin_margin] | max %}
+      {% set cand3_ok = cand3_x >= xmin_margin %}
+
+      {% set cand4_x = obj_xmax + clear %}
+      {% set cand4_y = [obj_ymin, ymin_margin] | max %}
+      {% set cand4_ok = (cand4_x + line_len) <= bed_x %}
+
+      {% set cand5_x = [obj_xmin, xmin_margin] | max %}
+      {% set cand5_y = obj_ymax + clear %}
+      {% set cand5_ok = (cand5_y + 5) <= bed_y %}
+
+      {% if cand1_ok %}
+        {% set x_origin = cand1_x %}
+        {% set y_purge  = cand1_y %}
+        {% set purge_dir = "X+" %}
+      {% elif cand2_ok %}
+        {% set x_origin = cand2_x %}
+        {% set y_purge  = cand2_y %}
+        {% set purge_dir = "X+" %}
+      {% elif cand3_ok %}
+        {% set x_origin = cand3_x %}
+        {% set y_purge  = cand3_y %}
+        {% set purge_dir = "Y+" %}
+      {% elif cand4_ok %}
+        {% set x_origin = cand4_x %}
+        {% set y_purge  = cand4_y %}
+        {% set purge_dir = "Y+" %}
+      {% elif cand5_ok %}
+        {% set x_origin = cand5_x %}
+        {% set y_purge  = cand5_y %}
+        {% set purge_dir = "X+" %}
+      {% else %}
+        {% set x_origin = xmin_margin %}
+        {% set y_purge  = ymin_margin %}
+        {% set purge_dir = "X+" %}
+      {% endif %}
+    {% endif %}
+  {% endif %}
+
+  {% set x_origin = [x_origin, xmin_margin] | max %}
+  {% set y_purge  = [y_purge,  ymin_margin] | max %}
+
+  G92 E0
+  G0 F{travel_speed}
+  G90
+  G0 X{x_origin} Y{y_purge} Z{z_h}
+  M83
+
+  {% if purge_dir == "X+" %}
+    G1 X{x_origin + line_len} E{purge_mm} F{purge_move_speed}
+  {% else %}
+    G1 Y{y_purge + line_len} E{purge_mm} F{purge_move_speed}
+  {% endif %}
+
+  G1 E-0.2 F2100
+  G92 E0
+  M82
+  G0 Z{z_h * 2} F{travel_speed}
+
+
+######################################################################
+#  HEAT_SOAK_IF_NEEDED
+######################################################################
+
+[gcode_macro HEAT_SOAK_IF_NEEDED]
+gcode:
+  {% set BED_TEMP = params.BED_TEMP|default(60)|float %}
+  {% set bottom = printer["temperature_sensor chamber_bottom"].temperature %}
+
+  {% if BED_TEMP > 90 and bottom < 45 %}
+    # Full 5-minute heat soak
+    M117 Heat soak 5 min (bed {BED_TEMP}°C / bottom {bottom|round(1)}°C)
+    G4 P300000
+  {% else %}
+    # Skip long soak – just heat bed + 1 min stabilize
+    M117 Skip heat soak (bed {BED_TEMP}°C / bottom {bottom|round(1)}°C)
+    M190 S{BED_TEMP}
+    G4 P60000
+  {% endif %}
+
+
+######################################################################
+#  ADAPTIVE_BED_MESH
+######################################################################
+
+[gcode_macro ADAPTIVE_BED_MESH]
+description: Adaptive bed mesh from exclude_object polygons with 10 mm overscan (clamped to bed limits)
+gcode:
+    {% set MARGIN = 10.0 %}
+
+    {% set mesh_min = printer.configfile.settings.bed_mesh.mesh_min %}
+    {% set mesh_max = printer.configfile.settings.bed_mesh.mesh_max %}
+    {% set probe_count = printer.configfile.settings.bed_mesh.probe_count %}
+    {% set algorithm = printer.configfile.settings.bed_mesh.algorithm | default('bicubic') %}
+
+    {% if probe_count is not sequence %}
+        {% set probe_count = [probe_count, probe_count] %}
+    {% endif %}
+
+    {% if printer.exclude_object is defined and printer.exclude_object.objects %}
+        {% set all_points = printer.exclude_object.objects | map(attribute='polygon') | sum(start=[]) %}
+
+        {% set x_min = all_points | map(attribute=0) | min %}
+        {% set y_min = all_points | map(attribute=1) | min %}
+        {% set x_max = all_points | map(attribute=0) | max %}
+        {% set y_max = all_points | map(attribute=1) | max %}
+
+        {% set adapted_min_x = [x_min - MARGIN, mesh_min[0]] | max %}
+        {% set adapted_min_y = [y_min - MARGIN, mesh_min[1]] | max %}
+        {% set adapted_max_x = [x_max + MARGIN, mesh_max[0]] | min %}
+        {% set adapted_max_y = [y_max + MARGIN, mesh_max[1]] | min %}
+
+        {% set span_x = adapted_max_x - adapted_min_x %}
+        {% set span_y = adapted_max_y - adapted_min_y %}
+        {% set full_span_x = mesh_max[0] - mesh_min[0] %}
+        {% set full_span_y = mesh_max[1] - mesh_min[1] %}
+
+        {% set points_x = ([3, ((span_x / full_span_x) * probe_count[0]) | round(0, 'ceil') | int] | max) %}
+        {% set points_y = ([3, ((span_y / full_span_y) * probe_count[1]) | round(0, 'ceil') | int] | max) %}
+
+        {% if algorithm == 'bicubic' and [points_x, points_y] | min < 4 %}
+            {% set algorithm = 'lagrange' %}
+        {% endif %}
+        {% if algorithm == 'lagrange' and [points_x, points_y] | max > 6 %}
+            {% set algorithm = 'bicubic' %}
+        {% endif %}
+
+        {action_respond_info("ADAPTIVE_BED_MESH: objects found → %.1f,%.1f → %.1f,%.1f  (%dx%d %s)" % (
+            adapted_min_x, adapted_min_y, adapted_max_x, adapted_max_y,
+            points_x, points_y, algorithm))}
+
+        BED_MESH_CLEAR
+        BED_MESH_CALIBRATE MESH_MIN={adapted_min_x},{adapted_min_y} MESH_MAX={adapted_max_x},{adapted_max_y} PROBE_COUNT={points_x},{points_y} ALGORITHM={algorithm}
+
+    {% else %}
+        {action_respond_info("ADAPTIVE_BED_MESH: no exclude_object data – doing full bed mesh")}
+        BED_MESH_CLEAR
+        BED_MESH_CALIBRATE
+    {% endif %}
